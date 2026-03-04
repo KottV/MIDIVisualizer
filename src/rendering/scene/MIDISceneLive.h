@@ -39,6 +39,7 @@ public:
 
 	const std::string& deviceName() const;
 
+	static const std::vector<libremidi::input_port>& availableInputPorts(bool force = false);
 	static const std::vector<std::string> & availablePorts(bool force = false);
 	
 private:
@@ -71,11 +72,20 @@ private:
 	std::string _deviceName;
 	bool _verbose = false;
 
-	static libremidi::midi_in & shared();
+	// --- Modern libremidi statics ---
+	// Observer for port enumeration (replaces midi_in::get_port_count/get_port_name).
+	static libremidi::observer& sharedObserver();
+	// Shared midi_in instance. Created on-demand when a port is opened.
+	static libremidi::midi_in& sharedMidiIn();
+	static void createMidiIn();
 
-	static libremidi::midi_in * _sharedMIDIIn;
-	static std::vector<std::string> _availablePorts;
-	static int _refreshIndex;
+static libremidi::observer* _sharedObserver;
+static libremidi::midi_in*  _sharedMIDIIn;
+static std::vector<libremidi::input_port> _availableInputPorts;
+static std::vector<std::string> _availablePorts;
+static std::mutex _messageQueueMutex;
+static std::vector<libremidi::message> _messageQueue;
+static int _refreshIndex;
 
 };
 

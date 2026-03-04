@@ -21,24 +21,29 @@
 #define MAX_NOTES_IN_FLIGHT 8192
 
 MIDISceneLive::~MIDISceneLive(){
-	shared().close_port();
+	if(_sharedMIDIIn && _sharedMIDIIn->is_port_open()){
+	_sharedMIDIIn->close_port();
+}
 }
 
 MIDISceneLive::MIDISceneLive(int port, bool verbose) : MIDIScene() {
 	_verbose = verbose;
 	
-	// For now we use the same MIDI in instance for everything.
-	if(shared().is_port_open()){
-		shared().close_port();
+	// Close any previously open port.
+	if(_sharedMIDIIn && _sharedMIDIIn->is_port_open()){
+		_sharedMIDIIn->close_port();
 	}
 	if(port >= 0){
-		shared().open_port(port, "MIDIVisualizer input");
+	// Use the cached input_port objects from the observer.
+	const auto& ports = availableInputPorts(true);
+	if(port < (int)ports.size()){
+		sharedMidiIn().open_port(ports[port], "MIDIVisualizer input");
+	}
 		_deviceName = _availablePorts[port];
 	} else {
-		shared().open_virtual_port("MIDIVisualizer virtual input");
+		sharedMidiIn().open_virtual_port("MIDIVisualizer virtual input");
 		_deviceName = VIRTUAL_DEVICE_NAME;
 	}
-	shared().ignore_types(true, true, true);
 
 	_activeIds.fill(-1);
 	_activeRecording.fill(false);
@@ -80,16 +85,17 @@ void MIDISceneLive::updatesActiveNotes(double time, double speed, const FilterOp
 
 	int minUpdated = MAX_NOTES_IN_FLIGHT;
 	int maxUpdated = 0;
+	
+	// Drain the thread-safe message queue into a local vector.
+	std::vector<libremidi::message> incomingMessages;
+	{
+		std::lock_guard<std::mutex> lock(_messageQueueMutex);
+		incomingMessages.swap(_messageQueue);
+	}
 
 	// If we are paused, just empty the queue.
 	if(_previousTime == time){
-		while(true){
-			auto message = shared().get_message();
-			if(message.size() == 0){
-				// End of the queue.
-				break;
-			}
-		}
+	// Messages already drained above, just discard them.
 		return;
 	}
 
@@ -136,15 +142,9 @@ void MIDISceneLive::updatesActiveNotes(double time, double speed, const FilterOp
 	frame.timestamp = time;
 	frame.messages.reserve(8);
 
-	while(true){
-		auto message = shared().get_message();
-		if(message.size() == 0){
-			// End of the queue.
-			break;
-		}
-
-		// Store message for saving.
-		frame.messages.push_back(message);
+	for(auto& message : incomingMessages){
+		frame.messages.push_back(std::move(message));
+		message = frame.messages.back();
 
 		const auto type = message.get_message_type();
 		// Handle note events.
@@ -399,26 +399,77 @@ const std::string& MIDISceneLive::deviceName() const {
 	return _deviceName;
 }
 
-libremidi::midi_in * MIDISceneLive::_sharedMIDIIn = nullptr;
+libremidi::observer* MIDISceneLive::_sharedObserver = nullptr;
+libremidi::midi_in*  MIDISceneLive::_sharedMIDIIn  = nullptr;
+std::vector<libremidi::input_port> MIDISceneLive::_availableInputPorts;
 std::vector<std::string> MIDISceneLive::_availablePorts;
+std::mutex MIDISceneLive::_messageQueueMutex;
+std::vector<libremidi::message> MIDISceneLive::_messageQueue;
 int MIDISceneLive::_refreshIndex = 0;
 
-libremidi::midi_in & MIDISceneLive::shared(){
+libremidi::observer& MIDISceneLive::sharedObserver(){
+	if(_sharedObserver == nullptr){
+		libremidi::observer_configuration obs_config;
+		obs_config.track_hardware = true;
+		obs_config.track_virtual  = true;
+		obs_config.track_any      = true;
+		_sharedObserver = new libremidi::observer(obs_config);
+	}
+	return *_sharedObserver;
+}
+
+void MIDISceneLive::createMidiIn(){
+	// Delete any previous instance.
+	delete _sharedMIDIIn;
+	_sharedMIDIIn = nullptr;
+
+	// Clear any stale messages from a previous session.
+	{
+		std::lock_guard<std::mutex> lock(_messageQueueMutex);
+		_messageQueue.clear();
+	}
+
+	libremidi::input_configuration in_config;
+	// Callback: push incoming messages into the thread-safe queue.
+	in_config.on_message = [](libremidi::message&& msg){
+		std::lock_guard<std::mutex> lock(_messageQueueMutex);
+		_messageQueue.push_back(std::move(msg));
+	};
+	in_config.ignore_sysex   = true;
+	in_config.ignore_timing  = true;
+	in_config.ignore_sensing = true;
+	in_config.timestamps     = libremidi::timestamp_mode::NoTimestamp;
+
+	// Use the same API as the observer for consistency.
+	auto api_config = libremidi::midi_in_configuration_for(sharedObserver());
+	_sharedMIDIIn = new libremidi::midi_in(in_config, api_config);
+}
+
+libremidi::midi_in& MIDISceneLive::sharedMidiIn(){
 	if(_sharedMIDIIn == nullptr){
-		_sharedMIDIIn = new libremidi::midi_in(libremidi::API::UNSPECIFIED, "MIDIVisualizer");
+		createMidiIn();
 	}
 	return *_sharedMIDIIn;
 }
 
+const std::vector<libremidi::input_port>& MIDISceneLive::availableInputPorts(bool force){
+	if((_refreshIndex == 0) || force){
+		_availableInputPorts = sharedObserver().get_input_ports();
+	}
+	return _availableInputPorts;
+}
+
 const std::vector<std::string> & MIDISceneLive::availablePorts(bool force){
 	if((_refreshIndex == 0) || force){
-		const int portCount = shared().get_port_count();
-		_availablePorts.resize(portCount);
-
-		for(int i = 0; i < portCount; ++i){
-			_availablePorts[i] = shared().get_port_name(i);
+	const auto& ports = availableInputPorts(force);
+	_availablePorts.resize(ports.size());
+	for(size_t i = 0; i < ports.size(); ++i){
+		// Use display_name if available, otherwise port_name.
+		_availablePorts[i] = ports[i].display_name.empty()
+			? ports[i].port_name
+			: ports[i].display_name;
+			}
 		}
-	}
 	// Only update once every 15 frames.
 	_refreshIndex = (_refreshIndex + 1) % 15;
 	return _availablePorts;
